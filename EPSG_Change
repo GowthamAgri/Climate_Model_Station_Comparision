@@ -1,0 +1,116 @@
+import os
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from shutil import copy2
+
+# =====================================================
+# USER INPUTS
+# =====================================================
+INPUT_DIR  = r"D:\New\Station Data\Move"
+OUTPUT_DIR = r"D:\New\Station Data\Move2"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TARGET_CRS = "EPSG:6933"
+
+# =====================================================
+# COUNTERS
+# =====================================================
+total_files   = 0
+copied_ok     = 0
+reprojected   = 0
+failed        = 0
+crs_mismatched = []
+
+print("\n=========== CRS CHECK & FIX START ===========\n")
+
+# =====================================================
+# WALK THROUGH FOLDERS
+# =====================================================
+for root, dirs, files in os.walk(INPUT_DIR):
+
+    rel_path   = os.path.relpath(root, INPUT_DIR)
+    out_folder = os.path.join(OUTPUT_DIR, rel_path)
+    os.makedirs(out_folder, exist_ok=True)
+
+    for fname in files:
+        if not fname.lower().endswith(".tif"):
+            continue
+
+        total_files += 1
+        in_path  = os.path.join(root, fname)
+        out_path = os.path.join(out_folder, fname)
+
+        try:
+            with rasterio.open(in_path) as src:
+
+                current_crs = src.crs.to_string() if src.crs else None
+
+                # If CRS matches target → copy as-is
+                if current_crs == TARGET_CRS:
+                    copy2(in_path, out_path)
+                    copied_ok += 1
+                    print(f"✔ CRS OK → Copied: {rel_path}\\{fname}")
+                    continue
+
+                # Otherwise → Report + Reproject
+                print(f"🔁 CRS Mismatch → Reprojecting: {rel_path}\\{fname}")
+                crs_mismatched.append((fname, current_crs))
+
+                transform, width, height = calculate_default_transform(
+                    src.crs,
+                    TARGET_CRS,
+                    src.width,
+                    src.height,
+                    *src.bounds
+                )
+
+                profile = src.profile.copy()
+                profile.update({
+                    "crs": TARGET_CRS,
+                    "transform": transform,
+                    "width": width,
+                    "height": height,
+                    "dtype": "float32",
+                    "compress": "lzw"
+                })
+
+                with rasterio.open(out_path, "w", **profile) as dst:
+                    for b in range(1, src.count + 1):
+                        reproject(
+                            source=rasterio.band(src, b),
+                            destination=rasterio.band(dst, b),
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=transform,
+                            dst_crs=TARGET_CRS,
+                            resampling=Resampling.nearest
+                        )
+
+                reprojected += 1
+                print(f"✅ Reprojected: {rel_path}\\{fname}")
+
+        except Exception as e:
+            failed += 1
+            print(f"❌ FAILED: {rel_path}\\{fname}")
+            print(f"   Reason: {e}")
+
+
+# =====================================================
+# FINAL REPORT
+# =====================================================
+print("\n=========== FINAL REPORT ===========")
+print(f"Total TIFF files      : {total_files}")
+print(f"Copied (CRS OK)       : {copied_ok}")
+print(f"Reprojected (Fixed)   : {reprojected}")
+print(f"Failed                : {failed}")
+print("====================================")
+
+# CRS mismatch list
+if crs_mismatched:
+    print("\nCRS MISMATCH FILES:")
+    for f, cr in crs_mismatched:
+        print(f" - {f} | CRS was: {cr}")
+else:
+    print("\nNo CRS mismatches found.")
+
+print("\n🎯 CRS CHECK + FIX COMPLETED")

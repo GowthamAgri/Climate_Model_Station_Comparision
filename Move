@@ -1,0 +1,58 @@
+import os
+import shutil
+
+MAIN_FOLDER = r"D:\New\Station Data\Sample_Processed_Output1"
+OUTPUT_FOLDER = r"D:\New\Station Data\Move"
+
+KEY_MAP = {
+    "DTR": ["DTR"],
+    "MAX": ["MAX", "TMAX", "_TX", "TX_"],
+    "MIN": ["MIN", "TMIN", "_TN", "TN_"],
+    "SRD": ["SRD", "SRAD"],
+    "TMEAN": ["TMEAN", "MEAN"]
+}
+
+# Create structure
+for k in KEY_MAP.keys():
+    os.makedirs(os.path.join(OUTPUT_FOLDER, k), exist_ok=True)
+
+for state in os.listdir(MAIN_FOLDER):
+    state_path = os.path.join(MAIN_FOLDER, state)
+    if not os.path.isdir(state_path):
+        continue
+
+    geo_folder = os.path.join(state_path, "GeoTIFF_outputs")
+    if not os.path.isdir(geo_folder):
+        continue
+
+    for file in os.listdir(geo_folder):
+        if not file.lower().endswith(".tif"):
+            continue
+        
+        f_upper = file.upper()
+
+        matched_type = None
+        for tif_type, patterns in KEY_MAP.items():
+            if any(p in f_upper for p in patterns):
+                matched_type = tif_type
+                break
+        
+        if matched_type is None:
+            print(f"❓ Unknown type: {file}")
+            continue
+
+        src = os.path.join(geo_folder, file)
+        dest_state = os.path.join(OUTPUT_FOLDER, matched_type, state)
+        os.makedirs(dest_state, exist_ok=True)
+        dest = os.path.join(dest_state, file)
+
+        if not os.path.exists(src):
+            print(f"⚠ Missing source, skipping: {src}")
+            continue
+        
+        if os.path.exists(dest):
+            print(f"✔ Already exists: {file}")
+            continue
+
+        shutil.move(src, dest)
+        print(f"Moved: {file} → {matched_type}/{state}")

@@ -1,0 +1,78 @@
+import os
+import re
+import rasterio
+import numpy as np
+
+# ------------------- CONFIG -------------------
+TMAX_DIR = r"D:\New\IMD_Gridded\IMD_Tmax_Final"
+TMIN_DIR = r"D:\New\IMD_Gridded\IMD_Tmin_Final"
+OUT_DIR  = r"D:\New\IMD_Gridded\IMD_SRD_Final"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+kRs = 0.16   # Hargreaves coefficient
+
+# ------------------- HELPER: Extract year from filename -------------------
+def extract_year(filename):
+    match = re.search(r'(19\d{2}|20\d{2})', filename)
+    return int(match.group()) if match else None
+
+# ------------------- SCAN FILES -------------------
+tmax_dict = {}
+tmin_dict = {}
+
+for fname in os.listdir(TMAX_DIR):
+    year = extract_year(fname)
+    if year:
+        tmax_dict[year] = fname
+
+for fname in os.listdir(TMIN_DIR):
+    year = extract_year(fname)
+    if year:
+        tmin_dict[year] = fname
+
+# ------------------- PROCESS YEARS -------------------
+common_years = sorted(set(tmax_dict.keys()) & set(tmin_dict.keys()))
+
+for year in common_years:
+
+    tmax_file = os.path.join(TMAX_DIR, tmax_dict[year])
+    tmin_file = os.path.join(TMIN_DIR, tmin_dict[year])
+    out_file  = os.path.join(OUT_DIR, f"SRAD_{year}.tif")
+
+    print(f"\n=== YEAR {year} ===")
+
+    try:
+        with rasterio.open(tmax_file) as src_tmax, rasterio.open(tmin_file) as src_tmin:
+
+            # ------------------- QC CHECK 1: CRS -------------------
+            if src_tmax.crs != src_tmin.crs:
+                print(f"🚫 CRS mismatch → Tmax: {src_tmax.crs}, Tmin: {src_tmin.crs}")
+                print("   ❌ Skipping this year.")
+                continue
+
+            # ------------------- QC CHECK 2: RESOLUTION -------------------
+            if src_tmax.res != src_tmin.res:
+                print(f"🚫 Resolution mismatch → Tmax: {src_tmax.res}, Tmin: {src_tmin.res}")
+                print("   ❌ Skipping this year.")
+                continue
+
+            # ------------------- COMPUTE SRAD (Hargreaves) -------------------
+            tmax = src_tmax.read(1).astype(np.float32)
+            tmin = src_tmin.read(1).astype(np.float32)
+
+            tmean = (tmax + tmin) / 2.0
+            td = np.maximum(tmax - tmin, 0.1)
+
+            srad = kRs * np.sqrt(td) * tmean   # MJ/m2/day
+
+            profile = src_tmax.profile
+            profile.update(dtype='float32', compress='lzw')
+
+            with rasterio.open(out_file, "w", **profile) as dst:
+                dst.write(srad, 1)
+
+            print(f"✅ SRAD computed successfully for {year}")
+
+    except Exception as e:
+        print(f"❌ FAILED for year {year}")
+        print(f"   Reason: {e}")

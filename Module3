@@ -1,0 +1,79 @@
+# =============================================================================
+# MODULE 3 (Updated for your Module-2 output format)
+# Requires: OBS.npy, ERA5.npy, CFSv2.npy, IMD.npy, DATES.npy
+# Produces: seasonal OBS, ERA5, CFSv2, IMD + years.npy
+# =============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+
+INPUT_DIR  = r"D:\New\Trial\QC_Outputs\Extracted"
+OUTPUT_DIR = r"D:\New\Trial\QC_Outputs\Seasonal"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+SEASONS = {
+    "DJF": [12, 1, 2],
+    "MAM": [3, 4, 5],
+    "JJAS": [6, 7, 8, 9],
+    "ON":  [10, 11]
+}
+
+MODELS = ["OBS", "ERA5", "CFSv2", "IMD"]
+COVERAGE_THRESHOLD = 0.75
+
+stations = [d for d in os.listdir(INPUT_DIR) if os.path.isdir(os.path.join(INPUT_DIR, d))]
+
+diag = []
+print(f"Stations found for seasonal aggregation: {len(stations)}\n")
+
+for st in stations:
+    sp = os.path.join(INPUT_DIR, st)
+    outst = os.path.join(OUTPUT_DIR, st)
+    os.makedirs(outst, exist_ok=True)
+
+    try:
+        dates = np.load(os.path.join(sp, "DATES.npy")).astype("datetime64[D]")
+    except:
+        print(f"Skipping {st}: missing DATES.npy")
+        continue
+
+    years  = pd.to_datetime(dates).year.values
+    months = pd.to_datetime(dates).month.values
+    unique_years = np.unique(years)
+
+    print(f"➡ Processing {st}")
+
+    for season, months_sel in SEASONS.items():
+        for model in MODELS:
+            infile = os.path.join(sp, f"{model}.npy")
+            if not os.path.exists(infile):
+                print(f"Missing {model} for {st}, skipping model")
+                continue
+
+            data = np.load(infile).astype(float)
+            data[data < -9990] = np.nan
+
+            seasonal_vals = []
+
+            for y in unique_years:
+                idx = np.where((years == y) & np.isin(months, months_sel))[0]
+                if len(idx) == 0:
+                    seasonal_vals.append(np.nan)
+                    continue
+
+                subset = data[idx]
+                valid = np.sum(~np.isnan(subset))
+                cov = valid / len(subset)
+
+                if cov >= COVERAGE_THRESHOLD:
+                    seasonal_vals.append(np.nanmean(subset))
+                else:
+                    seasonal_vals.append(np.nan)
+                    diag.append([st, y, season, model, cov, "DROPPED"])
+
+            np.save(os.path.join(outst, f"{model}_Tmax_{season}.npy"), np.array(seasonal_vals))
+
+    np.save(os.path.join(outst, "years.npy"), unique_years)
+
+print("\n🎯 MODULE 3 COMPLETED")

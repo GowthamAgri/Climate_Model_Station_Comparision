@@ -1,0 +1,142 @@
+# =============================================================================
+# MODULE 4: metrics_bootstrap.py (Updated for your Module 3 output)
+# Evaluates seasonal Tmax for ERA5, CFSv2, IMD vs OBS using:
+# MBE, MAB, MAE, RMSE, r, NSE, KGE, Willmott-d, StdRatio, CV
+# Adds bootstrap 2000 CI (percentile), constant detection, ranking
+# =============================================================================
+
+import os
+import time
+import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr
+
+INPUT_DIR  = r"D:\New\Trial\QC_Outputs\Seasonal"
+OUTPUT_DIR = r"D:\New\Trial\QC_Outputs\Metrics"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MODELS  = ["ERA5", "CFSv2", "IMD"]
+OBS     = "OBS"
+SEASONS = ["DJF", "MAM", "JJAS", "ON"]
+
+B = 2000        # bootstrap iterations
+MIN_YEARS = 20  # minimum valid years
+CONF = [2.5, 50, 97.5]
+EPS = 1e-10
+
+constant_log = []
+skipped = []
+
+def compute_metrics(obs, sim):
+    mask = (~np.isnan(obs)) & (~np.isnan(sim))
+    obs, sim = obs[mask], sim[mask]
+    if len(obs) < MIN_YEARS:
+        return None, True
+
+    oc = np.std(obs) < EPS
+    sc = np.std(sim) < EPS
+    r = np.nan if oc or sc else pearsonr(obs, sim)[0]
+
+    mbe = np.mean(sim - obs)
+    mab = np.mean(np.abs(sim - obs))
+    rmse = np.sqrt(np.mean((sim - obs)**2))
+    nse = 1 - np.sum((sim - obs)**2) / (np.sum((obs - np.mean(obs))**2) + EPS)
+
+    a = np.std(sim)/(np.std(obs)+EPS)
+    b = np.mean(sim)/(np.mean(obs)+EPS)
+    kge = 1 - np.sqrt((r-1)**2 + (a-1)**2 + (b-1)**2)
+
+    d = 1 - (np.sum((sim-obs)**2) /
+             np.sum((np.abs(sim-np.mean(obs)) + np.abs(obs-np.mean(obs)))**2 + EPS))
+
+    std_ratio = np.std(sim)/(np.std(obs)+EPS)
+    cv = (np.std(sim)/(np.mean(sim)+EPS))*100
+
+    return {
+        "MBE": mbe, "MAB": mab, "MAE": mab, "RMSE": rmse, "r": r,
+        "NSE": nse, "KGE": kge, "Willmott_d": d,
+        "Std_Ratio": std_ratio, "CV": cv, "N": len(obs),
+        "Constant_OBS": oc, "Constant_SIM": sc
+    }, False
+
+
+def bootstrap_ci(obs, sim):
+    mask = (~np.isnan(obs)) & (~np.isnan(sim))
+    obs, sim = obs[mask], sim[mask]
+    idx = np.arange(len(obs))
+    boot = {m: [] for m in ["MBE","MAE","RMSE","r","NSE","KGE","Willmott_d","Std_Ratio","CV"]}
+
+    for _ in range(B):
+        ii = np.random.choice(idx, size=len(idx), replace=True)
+        m, _ = compute_metrics(obs[ii], sim[ii])
+        if m is None: continue
+        for k in boot: boot[k].append(m[k])
+
+    return {f"{k}_CI": np.percentile(boot[k], CONF).tolist() for k in boot}
+
+
+stations = [s for s in os.listdir(INPUT_DIR) if os.path.isdir(os.path.join(INPUT_DIR, s))]
+print("Total stations:", len(stations))
+
+rows = []
+t0 = time.time()
+
+for i, st in enumerate(stations, 1):
+    sp = os.path.join(INPUT_DIR, st)
+    print(f"[{i}/{len(stations)}] {st}")
+
+    try:
+        years = np.load(os.path.join(sp, "years.npy"))
+    except:
+        skipped.append([st, "Missing years"])
+        continue
+
+    for season in SEASONS:
+        try:
+            obs = np.load(os.path.join(sp, f"{OBS}_Tmax_{season}.npy"))
+        except:
+            skipped.append([st, f"Missing OBS {season}"])
+            continue
+
+        for model in MODELS:
+            try:
+                sim = np.load(os.path.join(sp, f"{model}_Tmax_{season}.npy"))
+            except:
+                skipped.append([st, f"Missing {model} {season}"])
+                continue
+
+            met, bad = compute_metrics(obs, sim)
+            if bad:
+                skipped.append([st, f"{model} {season} insufficient years"])
+                continue
+
+            if met["Constant_OBS"] or met["Constant_SIM"]:
+                constant_log.append([st, season, model, met["Constant_OBS"], met["Constant_SIM"]])
+
+            ci = bootstrap_ci(obs, sim)
+            row = {"Station": st, "Season": season, "Model": model,
+                   **{k:met[k] for k in met if k not in ["Constant_OBS","Constant_SIM"]}}
+            row.update(ci)
+            rows.append(row)
+
+df = pd.DataFrame(rows)
+df.to_csv(os.path.join(OUTPUT_DIR,"Station_Seasonal.csv"), index=False)
+
+summary = df.groupby(["Season","Model"]).mean(numeric_only=True)
+summary.to_csv(os.path.join(OUTPUT_DIR,"Summary_Per_Season.csv"))
+
+rk = summary.copy()
+rk["Score"] = rk["r"] + rk["KGE"] + rk["Willmott_d"] - rk["RMSE"]
+rk.sort_values(["Season","Score"], ascending=False)\
+  .to_csv(os.path.join(OUTPUT_DIR,"Ranking_Per_Season.csv"))
+
+if skipped:
+    pd.DataFrame(skipped, columns=["Station","Reason"]).to_csv(
+        os.path.join(OUTPUT_DIR,"Skipped_Stations.csv"), index=False)
+
+if constant_log:
+    pd.DataFrame(constant_log, columns=["Station","Season","Model",
+                                        "OBS_Constant","SIM_Constant"]).to_csv(
+        os.path.join(OUTPUT_DIR,"Constant_Cases.csv"), index=False)
+
+print(f"\n🎯 MODULE 4 COMPLETED in {(time.time()-t0)/60:.2f} min")

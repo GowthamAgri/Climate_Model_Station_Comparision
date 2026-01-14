@@ -1,0 +1,187 @@
+# ================================================================
+# MODULE 1: precheck_qc.py  (UPDATED with station res tolerance + filename parser)
+# ================================================================
+
+import os
+import rasterio
+import pandas as pd
+
+STATION_DIR = r"D:\New\Station Data\Move2\MIN"
+
+MODEL_FILES = {
+    "ERA5":  r"D:\New\ERA5\ERA5_Tn_Full.tif",
+    "CFSv2": r"D:\New\CFS_v2\CFSv2_Tn_Full.tif",
+    "IMD":   r"D:\New\IMD_Tmin_Full.tif"
+}
+
+REQUIRED_CRS = "EPSG:6933"
+REQUIRED_RES = 25000.0
+REQUIRED_BANDS = 12784
+RES_TOLERANCE = 3000.0   # meters tolerance for stations only
+
+QC_OUTPUT = os.path.join(STATION_DIR, "QC_Outputs")
+os.makedirs(QC_OUTPUT, exist_ok=True)
+
+def get_station_files(root_folder):
+    tif_list = []
+    for root, dirs, files in os.walk(root_folder):
+        for f in files:
+            if f.lower().endswith(".tif"):
+                tif_list.append(os.path.join(root, f))
+    return tif_list
+
+# ---- UPDATED FILENAME PARSER ----
+def parse_station_name(fname):
+    base = os.path.basename(fname)
+    name, _ = os.path.splitext(base)
+    parts = name.split("_")
+
+    code = None
+    code_index = None
+
+    # Find first numeric token = station code
+    for i, p in enumerate(parts):
+        if p.isdigit():
+            code = p
+            code_index = i
+            break
+
+    if code:
+        # Option B: keep STATE + STATIONNAME
+        station_name = "_".join(parts[:code_index])
+    else:
+        station_name = "_".join(parts)
+        code = "UNKNOWN"
+
+    return station_name, code
+
+df_station_pass = []
+df_station_fail = []
+df_model_fail = []
+model_meta = {}
+
+# ---- MODEL QC ---------------------------------------------------
+for model_name, model_path in MODEL_FILES.items():
+    try:
+        with rasterio.open(model_path) as src:
+            crs = src.crs.to_string() if src.crs else "NONE"
+            res = src.res
+            bands = src.count
+            bounds = src.bounds
+
+            model_meta[model_name] = {
+                "crs": crs, "res": res, "bands": bands,
+                "bounds": bounds, "path": model_path
+            }
+
+            model_ok = True
+            fail_reason = []
+
+            if crs != REQUIRED_CRS:
+                model_ok = False
+                fail_reason.append(f"CRS mismatch (got {crs})")
+
+            if not (abs(res[0] - REQUIRED_RES) < 1e-6 and abs(res[1] - REQUIRED_RES) < 1e-6):
+                model_ok = False
+                fail_reason.append(f"Resolution mismatch (got {res})")
+
+            if bands != REQUIRED_BANDS:
+                model_ok = False
+                fail_reason.append(f"Band count mismatch (got {bands})")
+
+            if not model_ok:
+                df_model_fail.append({
+                    "Model": model_name, "Path": model_path,
+                    "Reason": "; ".join(fail_reason)
+                })
+                print(f"⚠️ Model FAILED QC: {model_name} → {fail_reason}")
+            else:
+                print(f"✅ Model PASSED QC: {model_name}")
+
+    except Exception as e:
+        df_model_fail.append({
+            "Model": model_name, "Path": model_path,
+            "Reason": f"Error reading: {e}"
+        })
+        print(f"❌ ERROR reading model {model_name}: {e}")
+
+# ---- STATION QC -------------------------------------------------
+station_files = get_station_files(STATION_DIR)
+print(f"\nFound {len(station_files)} station files\n")
+
+for st_path in station_files:
+    station_name, station_code = parse_station_name(st_path)
+    try:
+        with rasterio.open(st_path) as src:
+            crs = src.crs.to_string() if src.crs else "NONE"
+            res = src.res
+            bands = src.count
+            width, height = src.width, src.height
+            transform = src.transform
+
+            station_ok = True
+            fail_reason = []
+
+            if crs != REQUIRED_CRS:
+                station_ok = False
+                fail_reason.append(f"CRS mismatch (got {crs})")
+
+            if abs(res[0] - REQUIRED_RES) > RES_TOLERANCE or abs(res[1] - REQUIRED_RES) > RES_TOLERANCE:
+                station_ok = False
+                fail_reason.append(
+                    f"Resolution mismatch (got {res[0]:.1f},{res[1]:.1f} m; allowed ±{RES_TOLERANCE} m)"
+                )
+
+            if bands != REQUIRED_BANDS:
+                station_ok = False
+                fail_reason.append(f"Band mismatch (got {bands})")
+
+            if not (width == 1 and height == 1):
+                station_ok = False
+                fail_reason.append(f"Raster not 1x1 (got {width}x{height})")
+
+            for model_name, meta in model_meta.items():
+                if model_name in [m["Model"] for m in df_model_fail]:
+                    continue
+                x = transform[2] + res[0]/2
+                y = transform[5] - res[1]/2
+                b = meta["bounds"]
+                if not (b.left <= x <= b.right and b.bottom <= y <= b.top):
+                    station_ok = False
+                    fail_reason.append(f"Out of bounds for model {model_name}")
+
+            if station_ok:
+                df_station_pass.append({
+                    "Station": station_name, "Code": station_code,
+                    "Path": st_path, "Lon": x, "Lat": y
+                })
+                print(f"   ✔ PASS: {station_name} ({station_code})")
+            else:
+                df_station_fail.append({
+                    "Station": station_name, "Code": station_code,
+                    "Path": st_path, "Reason": "; ".join(fail_reason)
+                })
+                print(f"   ❌ FAIL: {station_name} ({station_code}) → {fail_reason}")
+
+    except Exception as e:
+        df_station_fail.append({
+            "Station": station_name, "Code": station_code,
+            "Path": st_path, "Reason": f"Error reading: {e}"
+        })
+        print(f"   ❌ ERROR reading station {station_name}: {e}")
+
+# ---- SAVE RESULTS ------------------------------------------------
+if df_station_pass:
+    pd.DataFrame(df_station_pass).to_csv(os.path.join(QC_OUTPUT, "QC_Station_Passed.csv"), index=False)
+
+if df_station_fail:
+    pd.DataFrame(df_station_fail).to_csv(os.path.join(QC_OUTPUT, "QC_Station_Failed.csv"), index=False)
+
+if df_model_fail:
+    pd.DataFrame(df_model_fail).to_csv(os.path.join(QC_OUTPUT, "QC_Model_Failed.csv"), index=False)
+
+print("\nQC COMPLETED")
+print(f"Stations Passed: {len(df_station_pass)}")
+print(f"Stations Failed: {len(df_station_fail)}")
+print(f"Models Failed: {len(df_model_fail)}")
+print(f"Reports saved to: {QC_OUTPUT}")

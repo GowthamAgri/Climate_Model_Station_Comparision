@@ -1,0 +1,130 @@
+#=====================================================================
+# MODULE 2: read_and_extract.py   (Final)
+# Extracts daily time series for each station + aligns with models
+# =====================================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import rasterio
+from datetime import datetime
+
+# =====================================================
+# USER CONFIG
+# =====================================================
+QC_DIR     = r"D:\New\Station Data\Move2\MIN\QC_Outputs"
+OUTPUT_DIR = os.path.join(QC_DIR, "Extracted")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MODEL_FILES = {
+    "ERA5":  r"D:\New\ERA5\ERA5_Tn_Full.tif",
+    "CFSv2": r"D:\New\CFS_v2\CFSv2_Tn_Full.tif",
+    "IMD":   r"D:\New\IMD_Tmin_Full.tif"
+}
+
+START_DATE = "1990-01-01"
+END_DATE   = "2024-12-31"
+
+station_pass_file = os.path.join(QC_DIR, "QC_Station_Passed.csv")
+
+# =====================================================
+# LOAD PASSED STATIONS
+# =====================================================
+df = pd.read_csv(station_pass_file)
+print(f"Stations to extract: {len(df)}")
+
+# =====================================================
+# CREATE DATE AXIS ONCE
+# =====================================================
+dates = pd.date_range(start=START_DATE, end=END_DATE, freq="D")
+N_expected = len(dates)
+
+print(f"Expected daily bands: {N_expected}")
+print(f"Date range: {START_DATE} → {END_DATE}")
+
+# =====================================================
+# OPEN MODELS ONCE
+# =====================================================
+models = {}
+for mname, mfile in MODEL_FILES.items():
+    try:
+        src = rasterio.open(mfile)
+        if src.count != N_expected:
+            print(f"⚠ MODEL {mname} band mismatch: {src.count} vs {N_expected}")
+        models[mname] = src
+        print(f"✔ Loaded model: {mname}")
+    except Exception as e:
+        print(f"❌ ERROR: could not load model {mname}: {e}")
+        models[mname] = None
+
+# =====================================================
+# EXTRACTION LOOP
+# =====================================================
+for _, row in df.iterrows():
+
+    st_name = row["Station"]
+    st_code = str(row["Code"])
+    st_path = row["Path"]
+    lon = row["Lon"]
+    lat = row["Lat"]
+
+    print(f"\n➡ Extracting for station: {st_name} ({st_code})")
+
+    # output folder for station
+    st_out = os.path.join(OUTPUT_DIR, st_code)
+    os.makedirs(st_out, exist_ok=True)
+
+    # --------- READ OBSERVED TIF ----------
+    try:
+        with rasterio.open(st_path) as src_st:
+            obs_ts = src_st.read().astype(float).flatten()
+    except Exception as e:
+        print(f"❌ ERROR reading station {st_code}: {e}")
+        continue
+
+    # alignment safety check
+    if len(obs_ts) != N_expected:
+        print(f"❌ OBS band mismatch: {len(obs_ts)} vs {N_expected}")
+        continue
+
+    # save OBS + DATES
+    np.save(os.path.join(st_out, "OBS.npy"), obs_ts)
+    np.save(os.path.join(st_out, "DATES.npy"), dates.to_numpy(dtype='datetime64[D]'))
+
+    # save metadata
+    meta = {
+        "Station": st_name,
+        "Code": st_code,
+        "Lon": lon,
+        "Lat": lat
+    }
+
+    # --------- EXTRACT MODELS ----------
+    for mname, src in models.items():
+        if src is None:
+            print(f"   ⚠ Skipping {mname} (load failed)")
+            continue
+
+        try:
+            # sample point through time
+            sample = list(src.sample([(lon, lat)], indexes=range(1, src.count + 1)))
+            model_ts = np.array(sample[0], dtype=float)
+
+            if len(model_ts) != N_expected:
+                print(f"   ❌ {mname} band mismatch: {len(model_ts)} vs {N_expected}")
+                continue
+
+            np.save(os.path.join(st_out, f"{mname}.npy"), model_ts)
+            print(f"   ✔ Extracted {mname}")
+
+        except Exception as e:
+            print(f"   ❌ ERROR extracting {mname}: {e}")
+            continue
+
+    # write metadata
+    with open(os.path.join(st_out, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=4)
+
+print("\n🎯 MODULE 2 COMPLETED SUCCESSFULLY")
+print(f"Extracted time series stored in: {OUTPUT_DIR}")
